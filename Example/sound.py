@@ -73,6 +73,10 @@ class AudioVideoAnalyzerApp:
         self.gaze_data = []
         self.looking_at_camera_count = 0
         self.total_gaze_samples = 0
+        
+        # Gaze smoothing history
+        self.gaze_history_x = []
+        self.gaze_history_y = []
 
         master.bind("<KeyPress>", self.on_key_press)
         master.focus_set()
@@ -81,86 +85,162 @@ class AudioVideoAnalyzerApp:
         if event.keysym == "space":
             self.toggle_recording()
 
+    def save_audio_to_file(self, audio_data, sample_rate=SAMPLE_RATE):
+        """Save audio data to a WAV file"""
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"interview_audio_{timestamp}.wav"
+            
+            # Convert to numpy array and ensure proper format
+            audio_array = np.array(audio_data, dtype=np.float32)
+            
+            # Normalize audio to prevent clipping
+            if np.max(np.abs(audio_array)) > 0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+            
+            # Convert to 16-bit PCM format
+            audio_16bit = (audio_array * 32767).astype(np.int16)
+            
+            # Save using wave module
+            with wave.open(filename, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 2 bytes per sample (16-bit)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(audio_16bit.tobytes())
+            
+            print(f"Audio saved as: {filename}")
+            return filename
+            
+        except Exception as e:
+            print(f"Error saving audio: {e}")
+            return None
+
     def calculate_eye_gaze_direction(self, face_landmarks, frame_width, frame_height):
         """
-        Calculate eye gaze direction with STRICT camera detection
+        Calculate eye gaze direction with improved symmetry and accuracy
         Returns: (gaze_x, gaze_y, is_looking_at_camera)
         """
-        # Use reliable eye landmarks that definitely exist in MediaPipe Face Mesh
-        # Left eye landmarks
-        left_eye_outer = [face_landmarks.landmark[33].x, face_landmarks.landmark[33].y]   # Left eye outer corner
-        left_eye_inner = [face_landmarks.landmark[133].x, face_landmarks.landmark[133].y] # Left eye inner corner
-        left_eye_top = [face_landmarks.landmark[159].x, face_landmarks.landmark[159].y]    # Left eye top
-        left_eye_bottom = [face_landmarks.landmark[145].x, face_landmarks.landmark[145].y] # Left eye bottom
-        
-        # Right eye landmarks  
-        right_eye_inner = [face_landmarks.landmark[362].x, face_landmarks.landmark[362].y] # Right eye inner corner
-        right_eye_outer = [face_landmarks.landmark[263].x, face_landmarks.landmark[263].y] # Right eye outer corner
-        right_eye_top = [face_landmarks.landmark[386].x, face_landmarks.landmark[386].y]    # Right eye top
-        right_eye_bottom = [face_landmarks.landmark[374].x, face_landmarks.landmark[374].y] # Right eye bottom
-        
-        # Calculate eye centers (geometric center of eye landmarks)
-        left_eye_center_x = (left_eye_outer[0] + left_eye_inner[0]) / 2
-        left_eye_center_y = (left_eye_top[1] + left_eye_bottom[1]) / 2
-        
-        right_eye_center_x = (right_eye_inner[0] + right_eye_outer[0]) / 2
-        right_eye_center_y = (right_eye_top[1] + right_eye_bottom[1]) / 2
-        
-        # Calculate eye dimensions
-        left_eye_width = abs(left_eye_inner[0] - left_eye_outer[0])
-        left_eye_height = abs(left_eye_bottom[1] - left_eye_top[1])
-        
-        right_eye_width = abs(right_eye_outer[0] - right_eye_inner[0])
-        right_eye_height = abs(right_eye_bottom[1] - right_eye_top[1])
-        
-        # Use pupil/iris center landmarks (these should exist in MediaPipe)
-        # If these don't exist, we'll estimate from eye geometry
         try:
-            # Try to get more precise iris points
-            left_iris_x = face_landmarks.landmark[468].x if len(face_landmarks.landmark) > 468 else left_eye_center_x
-            left_iris_y = face_landmarks.landmark[468].y if len(face_landmarks.landmark) > 468 else left_eye_center_y
+            # More reliable eye landmarks for MediaPipe Face Mesh
+            # Left eye landmarks (from person's perspective)
+            left_eye_outer = face_landmarks.landmark[33]   # Left eye outer corner
+            left_eye_inner = face_landmarks.landmark[133]  # Left eye inner corner
+            left_eye_top = face_landmarks.landmark[159]    # Left eye top
+            left_eye_bottom = face_landmarks.landmark[145] # Left eye bottom
             
-            right_iris_x = face_landmarks.landmark[473].x if len(face_landmarks.landmark) > 473 else right_eye_center_x  
-            right_iris_y = face_landmarks.landmark[473].y if len(face_landmarks.landmark) > 473 else right_eye_center_y
-        except:
-            # Fallback to geometric centers
-            left_iris_x = left_eye_center_x
-            left_iris_y = left_eye_center_y
-            right_iris_x = right_eye_center_x
-            right_iris_y = right_eye_center_y
-        
-        # Calculate gaze direction (normalized to -1 to 1)
-        left_gaze_x = (left_iris_x - left_eye_center_x) / (left_eye_width / 2) if left_eye_width > 0 else 0
-        left_gaze_y = (left_iris_y - left_eye_center_y) / (left_eye_height / 2) if left_eye_height > 0 else 0
-        
-        right_gaze_x = (right_iris_x - right_eye_center_x) / (right_eye_width / 2) if right_eye_width > 0 else 0
-        right_gaze_y = (right_iris_y - right_eye_center_y) / (right_eye_height / 2) if right_eye_height > 0 else 0
-        
-        # Average both eyes
-        avg_gaze_x = (left_gaze_x + right_gaze_x) / 2
-        avg_gaze_y = (left_gaze_y + right_gaze_y) / 2
-        
-        # VERY STRICT thresholds for camera detection
-        horizontal_threshold = 0.05  # Very strict horizontal threshold
-        vertical_threshold = 0.1    # Strict vertical threshold
-        
-        # Face orientation check using nose
-        try:
+            # Right eye landmarks (from person's perspective)
+            right_eye_inner = face_landmarks.landmark[362] # Right eye inner corner
+            right_eye_outer = face_landmarks.landmark[263] # Right eye outer corner
+            right_eye_top = face_landmarks.landmark[386]   # Right eye top
+            right_eye_bottom = face_landmarks.landmark[374]# Right eye bottom
+            
+            # Calculate eye centers more accurately
+            left_eye_center_x = (left_eye_outer.x + left_eye_inner.x) / 2
+            left_eye_center_y = (left_eye_top.y + left_eye_bottom.y) / 2
+            
+            right_eye_center_x = (right_eye_inner.x + right_eye_outer.x) / 2
+            right_eye_center_y = (right_eye_top.y + right_eye_bottom.y) / 2
+            
+            # Calculate eye dimensions
+            left_eye_width = abs(left_eye_inner.x - left_eye_outer.x)
+            left_eye_height = abs(left_eye_bottom.y - left_eye_top.y)
+            
+            right_eye_width = abs(right_eye_outer.x - right_eye_inner.x)
+            right_eye_height = abs(right_eye_bottom.y - right_eye_top.y)
+            
+            # Get iris center landmarks (MediaPipe Face Mesh has 468 landmarks)
+            # These are approximate iris centers - landmarks 468-477 are iris landmarks
+            left_iris_center = None
+            right_iris_center = None
+            
+            # Try to get iris landmarks if available (newer MediaPipe versions)
+            if len(face_landmarks.landmark) > 468:
+                try:
+                    # Left iris center (approximate)
+                    left_iris_center = face_landmarks.landmark[468]
+                    # Right iris center (approximate) 
+                    right_iris_center = face_landmarks.landmark[473]
+                except IndexError:
+                    pass
+            
+            # Fallback: estimate pupil position using eye geometry
+            if left_iris_center is None:
+                # Use geometric center as fallback
+                left_iris_x = left_eye_center_x
+                left_iris_y = left_eye_center_y
+            else:
+                left_iris_x = left_iris_center.x
+                left_iris_y = left_iris_center.y
+                
+            if right_iris_center is None:
+                # Use geometric center as fallback
+                right_iris_x = right_eye_center_x
+                right_iris_y = right_eye_center_y
+            else:
+                right_iris_x = right_iris_center.x
+                right_iris_y = right_iris_center.y
+            
+            # Calculate gaze direction with improved normalization
+            # The key fix: ensure symmetric calculation for both eyes
+            if left_eye_width > 0:
+                left_gaze_x = (left_iris_x - left_eye_center_x) / (left_eye_width / 2)
+            else:
+                left_gaze_x = 0
+                
+            if left_eye_height > 0:
+                left_gaze_y = (left_iris_y - left_eye_center_y) / (left_eye_height / 2)
+            else:
+                left_gaze_y = 0
+            
+            if right_eye_width > 0:
+                right_gaze_x = (right_iris_x - right_eye_center_x) / (right_eye_width / 2)
+            else:
+                right_gaze_x = 0
+                
+            if right_eye_height > 0:
+                right_gaze_y = (right_iris_y - right_eye_center_y) / (right_eye_height / 2)
+            else:
+                right_gaze_y = 0
+            
+            # Average both eyes with equal weighting
+            avg_gaze_x = (left_gaze_x + right_gaze_x) / 2
+            avg_gaze_y = (left_gaze_y + right_gaze_y) / 2
+            
+            # Apply smoothing to reduce jitter
+            self.gaze_history_x.append(avg_gaze_x)
+            self.gaze_history_y.append(avg_gaze_y)
+            
+            # Keep only last 5 samples for smoothing
+            if len(self.gaze_history_x) > 5:
+                self.gaze_history_x.pop(0)
+                self.gaze_history_y.pop(0)
+                
+            # Use moving average for smoother gaze
+            smoothed_gaze_x = sum(self.gaze_history_x) / len(self.gaze_history_x)
+            smoothed_gaze_y = sum(self.gaze_history_y) / len(self.gaze_history_y)
+            
+            # Improved thresholds - more lenient and symmetric
+            horizontal_threshold = 0.15  # Increased from 0.05
+            vertical_threshold = 0.2     # Increased from 0.1
+            
+            # Face orientation check using nose tip
             nose_tip = face_landmarks.landmark[1]  # Nose tip
             face_center_x = 0.5  # Center of frame
             nose_deviation = abs(nose_tip.x - face_center_x)
-            face_orientation_threshold = 0.1  # Face must be mostly centered
+            face_orientation_threshold = 0.15  # Slightly more lenient
             face_facing_forward = nose_deviation < face_orientation_threshold
-        except:
-            face_facing_forward = True  # Default to true if nose detection fails
-        
-        # Determine if looking at camera with STRICT criteria
-        eyes_centered_horizontally = abs(avg_gaze_x) < horizontal_threshold
-        eyes_centered_vertically = abs(avg_gaze_y) < vertical_threshold
-        
-        is_looking_at_camera = eyes_centered_horizontally and eyes_centered_vertically and face_facing_forward
-        
-        return avg_gaze_x, avg_gaze_y, is_looking_at_camera
+            
+            # Determine if looking at camera
+            eyes_centered_horizontally = abs(smoothed_gaze_x) < horizontal_threshold
+            eyes_centered_vertically = abs(smoothed_gaze_y) < vertical_threshold
+            
+            is_looking_at_camera = eyes_centered_horizontally and eyes_centered_vertically and face_facing_forward
+            
+            return smoothed_gaze_x, smoothed_gaze_y, is_looking_at_camera
+            
+        except Exception as e:
+            print(f"Error in gaze calculation: {e}")
+            return 0.0, 0.0, False
 
     def save_video_with_moviepy(self, frames, fps=20):
         """Save video frames using MoviePy if available, otherwise fallback to OpenCV"""
@@ -234,14 +314,24 @@ class AudioVideoAnalyzerApp:
             self.pitch_data.append(dom_freq)
 
     def hand_eye_detection_loop(self):
+        """Improved version with better eye tracking and debugging"""
         self.cap = cv2.VideoCapture(0)
         self.hands = self.mp_hands.Hands(min_detection_confidence=0.5, min_tracking_confidence=0.5)
-        self.face_mesh = self.mp_face_mesh.FaceMesh(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,  # This enables iris landmarks
+            min_detection_confidence=0.5, 
+            min_tracking_confidence=0.5
+        )
 
         frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
         self.video_frames = []  # Reset frames list
+        
+        # Initialize gaze history
+        self.gaze_history_x = []
+        self.gaze_history_y = []
         
         cv2.namedWindow("Live Hand & Eye Gaze Detection", cv2.WINDOW_NORMAL)
 
@@ -282,16 +372,23 @@ class AudioVideoAnalyzerApp:
                     if is_looking_at_camera:
                         self.looking_at_camera_count += 1
                     
-                    # Draw eye landmarks
+                    # Draw eye landmarks with different colors for left/right
                     left_eye_indices = [33, 133, 159, 145, 153, 154, 155, 173]
                     right_eye_indices = [362, 263, 386, 374, 380, 381, 382, 398]
                     
-                    for idx in left_eye_indices + right_eye_indices:
+                    # Draw left eye in blue
+                    for idx in left_eye_indices:
                         lm = face_landmarks.landmark[idx]
                         x, y = int(lm.x * frame_width), int(lm.y * frame_height)
                         cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
+                    
+                    # Draw right eye in green
+                    for idx in right_eye_indices:
+                        lm = face_landmarks.landmark[idx]
+                        x, y = int(lm.x * frame_width), int(lm.y * frame_height)
+                        cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
-                    # Display gaze information with more detail
+                    # Enhanced gaze visualization
                     gaze_status = "👁️ CAMERA" if is_looking_at_camera else "👁️ AWAY"
                     color = (0, 255, 0) if is_looking_at_camera else (0, 0, 255)
                     
@@ -300,13 +397,27 @@ class AudioVideoAnalyzerApp:
                     cv2.putText(frame, f"X: {gaze_x:.3f}, Y: {gaze_y:.3f}", (30, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                     
+                    # Draw gaze direction indicator
+                    center_x = frame_width // 2
+                    center_y = frame_height // 2
+                    gaze_end_x = int(center_x + gaze_x * 100)  # Scale for visibility
+                    gaze_end_y = int(center_y + gaze_y * 100)
+                    cv2.arrowedLine(frame, (center_x, center_y), (gaze_end_x, gaze_end_y), 
+                                   (255, 255, 0), 3, tipLength=0.3)
+                    
+                    # Show debug info
+                    cv2.putText(frame, f"Samples: {self.total_gaze_samples}", (30, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+                    cv2.putText(frame, f"Camera: {self.looking_at_camera_count}", (30, 110),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+                    
                     # Show thresholds for debugging
-                    cv2.putText(frame, f"Threshold: ±0.1 (H), ±0.15 (V)", (30, 90),
+                    cv2.putText(frame, f"Threshold: ±0.15 (H), ±0.2 (V)", (30, 130),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
 
             cv2.imshow("Live Hand & Eye Gaze Detection", frame)
             
-            # Store frame for MoviePy
+            # Store frame for video
             self.video_frames.append(frame.copy())
 
             key = cv2.waitKey(1) & 0xFF
@@ -339,6 +450,8 @@ class AudioVideoAnalyzerApp:
         self.gaze_data = []
         self.looking_at_camera_count = 0
         self.total_gaze_samples = 0
+        self.gaze_history_x = []
+        self.gaze_history_y = []
 
         self.recording = True
         self.start_time = time.time()
@@ -380,6 +493,9 @@ class AudioVideoAnalyzerApp:
     def analyze_audio_and_gaze(self):
         print("Analyze audio and gaze")
 
+        # Save audio to file
+        self.audio_filename = self.save_audio_to_file(self.audio_data)
+
         # Audio analysis
         data = np.array(self.audio_data)
         skip_samples = 2 * SAMPLE_RATE
@@ -401,7 +517,7 @@ class AudioVideoAnalyzerApp:
         raw_pitch_variation = np.std(filtered_pitch) if len(filtered_pitch) > 0 else 0
         pitch_variation = max(0, raw_pitch_variation - 430)  # Subtract baseline, don't go negative
 
-        # Gaze analysis
+        # Gaze analysis with improved calculations
         camera_attention_percentage = 0
         if self.total_gaze_samples > 0:
             camera_attention_percentage = (self.looking_at_camera_count / self.total_gaze_samples) * 100
@@ -420,21 +536,31 @@ class AudioVideoAnalyzerApp:
         results.append(f"Pitch variation (raw): {raw_pitch_variation:.2f} Hz")
         results.append(f"Pitch variation (adjusted): {pitch_variation:.2f} Hz")
         
-        # Gaze results with stricter criteria
-        if camera_attention_percentage >= 80:
+        # Improved gaze results with more lenient criteria
+        if camera_attention_percentage >= 70:
             results.append("👁️ ✅ Excellent eye contact")
-        elif camera_attention_percentage >= 60:
+        elif camera_attention_percentage >= 50:
             results.append("👁️ ✅ Good eye contact")
-        elif camera_attention_percentage >= 40:
+        elif camera_attention_percentage >= 30:
             results.append("👁️ ⚠️ Fair eye contact")
-        elif camera_attention_percentage >= 20:
+        elif camera_attention_percentage >= 15:
             results.append("👁️ ❌ Poor eye contact")
         else:
             results.append("👁️ ❌ Very poor eye contact")
             
         results.append(f"Camera attention: {camera_attention_percentage:.1f}%")
 
-        extra_info = f"RMS (volume): {rms:.4f}\nGaze samples: {self.total_gaze_samples}\nBaseline subtracted: 430 Hz"
+        # Add file information
+        file_info = []
+        if self.audio_filename:
+            file_info.append(f"Audio saved: {self.audio_filename}")
+        if self.video_filename:
+            file_info.append(f"Video saved: {self.video_filename}")
+
+        extra_info = f"RMS (volume): {rms:.4f}\nGaze samples: {self.total_gaze_samples}\nBaseline subtracted: 430 Hz\nImproved eye tracking with smoothing"
+        
+        if file_info:
+            extra_info += "\n\nFiles saved:\n" + "\n".join(file_info)
 
         self.results_label.config(text="\n".join(results) + "\n\n" + extra_info)
         self.label.config(text="Press SPACE to start another recording")
@@ -489,6 +615,6 @@ class AudioVideoAnalyzerApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.geometry("460x350")
+    root.geometry("460x400")  # Made slightly taller to accommodate file info
     app = AudioVideoAnalyzerApp(root)
     root.mainloop()
