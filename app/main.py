@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends
+from typing import Optional
 from fastapi.responses import RedirectResponse
 from contextlib import asynccontextmanager
 
@@ -99,7 +100,8 @@ async def google_authorize():
 @app.get("/auth/linkedin/authorize")
 async def linkedin_authorize():
     authorization_url = await linkedin_oauth_client.get_authorization_url(
-        redirect_uri=f"{os.getenv('BACKEND_URL')}/auth/linkedin/callback"
+        redirect_uri=f"{os.getenv('BACKEND_URL')}/auth/linkedin/callback",
+        scope=["openid", "profile", "email"]
     )
     return {"authorization_url": authorization_url}
 
@@ -158,36 +160,42 @@ async def google_callback(
 
 @app.get("/auth/linkedin/callback")
 async def linkedin_callback(
-    code: str,
-    state: str = None,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
     user_manager = Depends(get_user_manager)
 ):
     try:
+        # Handle error responses from LinkedIn gracefully
+        if error:
+            print(f"LinkedIn OAuth error: {error} - {error_description}")
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/linkedin/callback?error={error}")
+
+        if not code:
+            print("LinkedIn OAuth callback missing 'code' parameter")
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/linkedin/callback?error=missing_code")
+
         # Get the OAuth access token
         redirect_uri = f"{os.getenv('BACKEND_URL')}/auth/linkedin/callback"
         token = await linkedin_oauth_client.get_access_token(code, redirect_uri)
         
-        # Fetch user info from LinkedIn using the access token
+        # Fetch user info via OpenID Connect userinfo endpoint
         import httpx
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                "https://api.linkedin.com/v2/people/~:(id,firstName,lastName,profilePicture(displayImage~:playableStreams))",
+                "https://api.linkedin.com/v2/userinfo",
                 headers={"Authorization": f"Bearer {token['access_token']}"}
             )
             response.raise_for_status()
-            profile_data = response.json()
-            
-            # Get email separately (LinkedIn requires different endpoint)
-            email_response = await client.get(
-                "https://api.linkedin.com/v2/emailAddresses?q=members&projection=(elements*(handle~))",
-                headers={"Authorization": f"Bearer {token['access_token']}"}
-            )
-            email_response.raise_for_status()
-            email_data = email_response.json()
-        
-        # Extract user info
-        linkedin_id = profile_data["id"]
-        email = email_data["elements"][0]["handle~"]["emailAddress"]
+            userinfo = response.json()
+
+        # Extract user info from OIDC userinfo response
+        linkedin_id = userinfo.get("sub")
+        email = userinfo.get("email")
+        if not email:
+            # Fallback: some accounts may not return email in userinfo; treat as error
+            return RedirectResponse(url=f"{FRONTEND_URL}/auth/linkedin/callback?error=email_not_returned")
         
         # Handle OAuth callback through user manager
         user = await user_manager.oauth_callback(
